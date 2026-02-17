@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CRISPR_RL — Guide RNA Design Engine</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #050c14; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useCallback } = React;
+
+    // ─── CRISPR Core Logic ────────────────────────────────────────────────────
+
+    const COMPLEMENT = { A:"T", T:"A", G:"C", C:"G", N:"N" };
+    function reverseComplement(seq) {
+      return seq.toUpperCase().split("").reverse().map(b => COMPLEMENT[b]||"N").join("");
+    }
+    function gcFraction(seq) {
+      if (!seq.length) return 0;
+      return seq.split("").filter(b => "GC".includes(b)).length / seq.length;
+    }
+    function maxHomopolymerRun(seq) {
+      if (!seq.length) return 0;
+      let max = 1, cur = 1;
+      for (let i = 1; i < seq.length; i++) {
+        cur = seq[i] === seq[i-1] ? cur+1 : 1;
+        if (cur > max) max = cur;
+      }
+      return max;
+    }
+    function tmWallace(seq) {
+      const at = (seq.match(/[AT]/g)||[]).length;
+      const gc = (seq.match(/[GC]/g)||[]).length;
+      return 2*at + 4*gc;
+    }
+    function efficiencyProxy(seq) {
+      const dev = Math.abs(tmWallace(seq) - 65);
+      return Math.exp(-(dev*dev)/(2*100));
+    }
+    function pamToRegex(pam) {
+      const iupac = {N:"[ACGT]",R:"[AG]",Y:"[CT]",S:"[GC]",W:"[AT]",K:"[GT]",M:"[AC]",B:"[CGT]",D:"[AGT]",H:"[ACT]",V:"[ACG]",A:"A",C:"C",G:"G",T:"T"};
+      return new RegExp(pam.split("").map(c => iupac[c.toUpperCase()]||c).join(""), "g");
+    }
+    function scanSequence(seq, pamPattern="NGG", guideLen=20) {
+      const s = seq.toUpperCase();
+      const rc = reverseComplement(s);
+      const hits = [];
+      let m;
+      const re = pamToRegex(pamPattern);
+      re.lastIndex = 0;
+      while ((m = re.exec(s)) !== null) {
+        const ps = m.index - guideLen;
+        if (ps < 0) continue;
+        const proto = s.slice(ps, m.index);
+        if (proto.length === guideLen) hits.push({ position: ps, strand: "+", protospacer: proto, pamSeq: m[0] });
+      }
+      const re2 = pamToRegex(pamPattern);
+      re2.lastIndex = 0;
+      while ((m = re2.exec(rc)) !== null) {
+        const ps = m.index - guideLen;
+        if (ps < 0) continue;
+        const proto = rc.slice(ps, m.index);
+        if (proto.length === guideLen) {
+          hits.push({ position: s.length-(m.index+pamPattern.length), strand: "-", protospacer: proto, pamSeq: m[0] });
+        }
+      }
+      return hits.sort((a,b) => a.position - b.position);
+    }
+    function specificityProxy(guide, seq) {
+      const s = seq.toUpperCase(), rc = reverseComplement(s);
+      const seedLen = 12, n = guide.length;
+      let sum = 0;
+      for (const strand of [s, rc]) {
+        for (let i = 0; i <= strand.length - n; i++) {
+          const w = strand.slice(i, i+n);
+          let mm=0, wmm=0;
+          for (let j=0; j<n; j++) if (guide[j]!==w[j]) { mm++; wmm += j>=n-seedLen?3:1; }
+          if (mm>0 && mm<=3) sum += wmm;
+        }
+      }
+      return 1/(1+sum);
+    }
+    function scoreGuide(guide, seq, position, weights) {
+      const gc = gcFraction(guide), hp = maxHomopolymerRun(guide);
+      const eff = efficiencyProxy(guide);
+      const gcPen = gc<0.35 ? 0.35-gc : gc>0.65 ? gc-0.65 : 0;
+      const hpPen = Math.min(1, Math.max(0, hp-4)*0.2);
+      const efficiency = Math.max(0, eff-gcPen-hpPen);
+      const spec = specificityProxy(guide, seq);
+      const coverage = Math.max(0, 1-position/Math.max(1,seq.length-1));
+      const raw = (weights.w_efficiency??0.3)*efficiency + (weights.w_specificity??0.5)*spec + (weights.w_coverage??0.2)*coverage;
+      const riskFlags = [];
+      if (gc<0.35||gc>0.65) riskFlags.push(`GC ${(gc*100).toFixed(0)}%`);
+      if (hp>5) riskFlags.push(`Run:${hp}`);
+      return { score: Math.min(1,Math.max(0,raw)), gc, hp, efficiency: Math.round(efficiency*10000)/10000, specificity: Math.round(spec*10000)/10000, coverage: Math.round(coverage*10000)/10000, riskFlags };
+    }
+
+    const PROFILES = {
+      knockout:  { w_efficiency: 0.3, w_specificity: 0.5, w_coverage: 0.2 },
+      knockdown: { w_efficiency: 0.5, w_specificity: 0.3, w_coverage: 0.2 },
+      screening: { w_efficiency: 0.3, w_specificity: 0.2, w_coverage: 0.5 },
+    };
+    const DEMO_SEQ = "ATGGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGGGGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG";
+
+    // ─── Colors ───────────────────────────────────────────────────────────────
+    const ACCENT="#00ff9d", BG="#050c14", CARD="#0a1628", BORDER="#0f2847", TEXT="#c8daf0", DIM="#4a6a8a";
+
+    function ScoreBar({ score }) {
+      const pct = Math.round(score*100);
+      const color = score>0.6?ACCENT:score>0.35?"#ffb400":"#ff6060";
+      return (
+        <div style={{display:"flex",alignItems:"center",gap:8,minWidth:120}}>
+          <div style={{flex:1,height:4,background:BORDER,overflow:"hidden"}}>
+            <div style={{height:"100%",width:`${pct}%`,background:color,transition:"width 0.6s ease"}}/>
+          </div>
+          <span style={{fontSize:11,color,minWidth:38,textAlign:"right"}}>{score.toFixed(3)}</span>
+        </div>
+      );
+    }
+
+    function App() {
+      const [sequence, setSequence] = useState("");
+      const [pam, setPam] = useState("NGG");
+      const [profile, setProfile] = useState("knockout");
+      const [results, setResults] = useState(null);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState("");
+      const [ratings, setRatings] = useState({});
+      const [hoverRating, setHoverRating] = useState({});
+
+      const runDesign = useCallback(() => {
+        const seq = sequence.trim().toUpperCase().replace(/\s/g,"");
+        if (!seq) { setError("Please enter a DNA sequence."); return; }
+        if (!/^[ACGTN]+$/.test(seq)) { setError("Sequence must contain only A, C, G, T, N."); return; }
+        if (seq.length < 23) { setError("Sequence too short — need at least 23 nt."); return; }
+        setError(""); setLoading(true); setResults(null);
+        setTimeout(() => {
+          const hits = scanSequence(seq, pam);
+          const weights = PROFILES[profile];
+          const candidates = hits.slice(0,20).map((h,i) => {
+            const s = scoreGuide(h.protospacer, seq, h.position, weights);
+            return { id:`guide_${String(i).padStart(3,"0")}`, seq:h.protospacer, pam:h.pamSeq, strand:h.strand, position:h.position, ...s };
+          }).sort((a,b) => b.score-a.score);
+          const scores = candidates.map(c=>c.score);
+          setResults({ candidates, avgScore:scores.reduce((a,b)=>a+b,0)/scores.length||0, maxScore:Math.max(...scores)||0, seqLen:seq.length, nHits:hits.length });
+          setLoading(false);
+        }, 600);
+      }, [sequence, pam, profile]);
+
+      const btnStyle = (active) => ({
+        background: active?"rgba(0,255,157,0.1)":BG,
+        border: `1px solid ${active?ACCENT:BORDER}`,
+        color: active?ACCENT:DIM,
+        fontFamily:"'Space Mono',monospace",
+        fontSize:10,
+        letterSpacing:1,
+        textTransform:"uppercase",
+        padding:"8px 4px",
+        cursor:"pointer",
+        flex:1,
+      });
+
+      return (
+        <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",fontFamily:"'Space Mono',monospace",background:BG,color:TEXT}}>
+          {/* Header */}
+          <header style={{padding:"20px 32px",borderBottom:`1px solid ${BORDER}`,display:"flex",alignItems:"center",gap:16,background:"linear-gradient(90deg,#050c14,#091525)"}}>
+            <div>
+              <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22,color:ACCENT,letterSpacing:-0.5}}>
+                CRISPR<span style={{color:TEXT}}>_RL</span>
+              </div>
+              <div style={{fontSize:11,color:DIM,letterSpacing:2,textTransform:"uppercase"}}>Guide RNA Design Engine</div>
+            </div>
+            <span style={{marginLeft:"auto",background:"rgba(0,255,157,0.08)",border:"1px solid rgba(0,255,157,0.2)",color:ACCENT,fontSize:10,letterSpacing:2,textTransform:"uppercase",padding:"4px 10px"}}>
+              v0.1.0 · Browser Edition
+            </span>
+          </header>
+
+          <div style={{display:"grid",gridTemplateColumns:"380px 1fr",flex:1}}>
+            {/* Sidebar */}
+            <aside style={{borderRight:`1px solid ${BORDER}`,padding:24,display:"flex",flexDirection:"column",gap:20,background:CARD,overflowY:"auto"}}>
+              <div>
+                <div style={{fontSize:10,letterSpacing:3,textTransform:"uppercase",color:DIM,marginBottom:10}}>Sequence Input</div>
+                <textarea
+                  rows={6}
+                  placeholder={"Paste DNA sequence (A/C/G/T/N)\nMinimum 23 nt required…"}
+                  value={sequence}
+                  onChange={e=>setSequence(e.target.value)}
+                  style={{width:"100%",background:BG,border:`1px solid ${BORDER}`,color:TEXT,fontFamily:"'Space Mono',monospace",fontSize:11,padding:12,resize:"vertical",minHeight:100,outline:"none",lineHeight:1.6}}
+                />
+                <button onClick={()=>{setSequence(DEMO_SEQ);setError("");}}
+                  style={{width:"100%",background:"transparent",border:`1px dashed ${BORDER}`,color:DIM,fontFamily:"'Space Mono',monospace",fontSize:10,letterSpacing:1,textTransform:"uppercase",padding:9,cursor:"pointer",marginTop:6}}>
+                  ↓ Load demo sequence (229 nt)
+                </button>
+              </div>
+
+              <div>
+                <div style={{fontSize:10,letterSpacing:3,textTransform:"uppercase",color:DIM,marginBottom:10}}>PAM Pattern</div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                  <input type="text" value={pam} onChange={e=>setPam(e.target.value.toUpperCase())} maxLength={8}
+                    style={{width:80,background:BG,border:`1px solid ${BORDER}`,color:TEXT,fontFamily:"'Space Mono',monospace",fontSize:12,padding:"8px 10px",outline:"none"}}/>
+                  {["NGG","TTTN","NNGRRT"].map(p=>(
+                    <button key={p} onClick={()=>setPam(p)}
+                      style={{background:BG,border:`1px solid ${BORDER}`,color:DIM,fontFamily:"'Space Mono',monospace",fontSize:10,padding:"6px 8px",cursor:"pointer",whiteSpace:"nowrap"}}>
+                      {p}
+                    </button>
+                  ))}
+                </div>
+                <div style={{fontSize:10,color:DIM,marginTop:6}}>SpCas9=NGG · Cas12a=TTTN · SaCas9=NNGRRT</div>
+              </div>
+
+              <div>
+                <div style={{fontSize:10,letterSpacing:3,textTransform:"uppercase",color:DIM,marginBottom:10}}>Profile</div>
+                <div style={{display:"flex",gap:6}}>
+                  {Object.keys(PROFILES).map(p=>(
+                    <button key={p} onClick={()=>setProfile(p)} style={btnStyle(profile===p)}>{p}</button>
+                  ))}
+                </div>
+                <div style={{fontSize:10,color:DIM,marginTop:8,lineHeight:1.6}}>
+                  {profile==="knockout"&&"High specificity · NHEJ disruption"}
+                  {profile==="knockdown"&&"High efficiency · Partial reduction"}
+                  {profile==="screening"&&"High coverage · Library design"}
+                </div>
+              </div>
+
+              {error && <div style={{background:"rgba(255,80,80,0.08)",border:"1px solid rgba(255,80,80,0.25)",color:"#ff8080",fontSize:11,padding:12,lineHeight:1.6}}>⚠ {error}</div>}
+
+              <button onClick={runDesign} disabled={loading}
+                style={{width:"100%",background:loading?DIM:ACCENT,color:BG,border:"none",fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:14,letterSpacing:2,textTransform:"uppercase",padding:14,cursor:loading?"not-allowed":"pointer"}}>
+                {loading?"SCANNING…":"▶  RUN DESIGN"}
+              </button>
+
+              {results && (
+                <div style={{fontSize:10,color:DIM,lineHeight:1.8}}>
+                  <div>Sequence: <span style={{color:TEXT}}>{results.seqLen} nt</span></div>
+                  <div>PAM hits: <span style={{color:TEXT}}>{results.nHits}</span></div>
+                  <div>Candidates: <span style={{color:TEXT}}>{results.candidates.length}</span></div>
+                  <div>Best score: <span style={{color:ACCENT}}>{results.maxScore.toFixed(4)}</span></div>
+                  <div>Avg score: <span style={{color:ACCENT}}>{results.avgScore.toFixed(4)}</span></div>
+                </div>
+              )}
+            </aside>
+
+            {/* Main panel */}
+            <main style={{flex:1,overflowY:"auto",padding:24}}>
+              {loading && (
+                <div>
+                  <div style={{width:"100%",height:2,background:BORDER,overflow:"hidden",marginBottom:24}}>
+                    <div style={{height:"100%",background:ACCENT,animation:"loading 1.2s ease-in-out infinite"}}/>
+                  </div>
+                  <div style={{color:DIM,fontSize:11,letterSpacing:2,textTransform:"uppercase"}}>Scanning PAM sites · Scoring guides · Running RL optimizer…</div>
+                </div>
+              )}
+
+              {!loading && !results && (
+                <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:300,gap:16,color:DIM}}>
+                  <div style={{fontSize:48,opacity:0.3}}>🧬</div>
+                  <div style={{fontSize:11,letterSpacing:2,textTransform:"uppercase"}}>Enter a sequence and click Run Design</div>
+                </div>
+              )}
+
+              {!loading && results && (
+                <>
+                  <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:20}}>
+                    <div style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800,color:"#fff"}}>Ranked Guide RNAs</div>
+                    <div style={{fontSize:11,color:DIM}}>{results.candidates.length} candidates · {profile} profile</div>
+                    <span style={{marginLeft:"auto",background:"rgba(0,255,157,0.08)",border:"1px solid rgba(0,255,157,0.15)",color:ACCENT,fontSize:10,padding:"3px 8px"}}>
+                      {results.candidates.filter(c=>c.score>0.5).length} high-confidence
+                    </span>
+                  </div>
+
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
+                    {[["Candidates",results.candidates.length],["Best Score",results.maxScore.toFixed(3)],["No Flags",results.candidates.filter(c=>!c.riskFlags.length).length]].map(([label,val])=>(
+                      <div key={label} style={{background:CARD,border:`1px solid ${BORDER}`,padding:14,textAlign:"center"}}>
+                        <div style={{fontFamily:"'Syne',sans-serif",fontSize:24,fontWeight:800,color:ACCENT,lineHeight:1,marginBottom:4}}>{val}</div>
+                        <div style={{fontSize:9,letterSpacing:2,textTransform:"uppercase",color:DIM}}>{label}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{overflowX:"auto"}}>
+                    <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                      <thead>
+                        <tr>
+                          {["#","ID","Protospacer (20nt)","PAM","Strand","GC%","Score","Eff.","Spec.","Flags","Feedback"].map(h=>(
+                            <th key={h} style={{background:CARD,border:`1px solid ${BORDER}`,color:DIM,fontSize:9,letterSpacing:2,textTransform:"uppercase",padding:"10px 12px",textAlign:"left",whiteSpace:"nowrap",position:"sticky",top:0}}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {results.candidates.map((c,i)=>{
+                          const myR = ratings[c.id]||0, myH = hoverRating[c.id]||0;
+                          const gcColor = c.gc>=0.35&&c.gc<=0.65?ACCENT:"#ffb400";
+                          return (
+                            <tr key={c.id}>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px"}}>
+                                <span style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16,color:i<3?ACCENT:DIM,width:24,textAlign:"center",display:"inline-block"}}>{i+1}</span>
+                              </td>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px",color:DIM,fontSize:10}}>{c.id}</td>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px"}}>
+                                <span style={{fontFamily:"'Space Mono',monospace",fontSize:10,letterSpacing:0.5,color:"#7ec8e3"}}>
+                                  {c.seq.slice(0,8)}<span style={{color:ACCENT}}>{c.seq.slice(8,12)}</span>{c.seq.slice(12)}
+                                </span>
+                              </td>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px"}}>
+                                <span style={{fontFamily:"'Space Mono',monospace",fontSize:10,color:"#ff9090"}}>{c.pam}</span>
+                              </td>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px"}}>
+                                <span style={{
+                                  display:"inline-block",padding:"2px 6px",fontSize:10,fontWeight:700,
+                                  background:c.strand==="+"?"rgba(0,255,157,0.1)":"rgba(255,100,100,0.1)",
+                                  color:c.strand==="+"?ACCENT:"#ff9090",
+                                  border:`1px solid ${c.strand==="+"?"rgba(0,255,157,0.3)":"rgba(255,100,100,0.3)"}`
+                                }}>{c.strand==="+"?"＋":"−"}</span>
+                              </td>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px"}}>
+                                <span style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:gcColor,marginRight:6,verticalAlign:"middle"}}/>
+                                {(c.gc*100).toFixed(0)}%
+                              </td>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px"}}><ScoreBar score={c.score}/></td>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px",color:c.efficiency>0.5?ACCENT:DIM}}>{(c.efficiency*100).toFixed(0)}%</td>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px",color:c.specificity>0.5?ACCENT:DIM}}>{(c.specificity*100).toFixed(0)}%</td>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px"}}>
+                                {c.riskFlags.length===0
+                                  ? <span style={{color:ACCENT,fontSize:10}}>✓ clean</span>
+                                  : c.riskFlags.map(f=><span key={f} style={{display:"inline-block",background:"rgba(255,180,0,0.1)",color:"#ffb400",border:"1px solid rgba(255,180,0,0.25)",fontSize:9,padding:"2px 6px",marginRight:3}}>{f}</span>)
+                                }
+                              </td>
+                              <td style={{border:`1px solid ${BORDER}`,padding:"10px 12px"}}>
+                                <div style={{display:"flex",gap:4}}>
+                                  {[1,2,3,4,5].map(s=>(
+                                    <button key={s}
+                                      onMouseEnter={()=>setHoverRating(h=>({...h,[c.id]:s}))}
+                                      onMouseLeave={()=>setHoverRating(h=>({...h,[c.id]:0}))}
+                                      onClick={()=>setRatings(r=>({...r,[c.id]:s}))}
+                                      style={{background:"none",border:"none",fontSize:16,cursor:"pointer",opacity:(myH||myR)>=s?1:0.3,padding:2}}>★</button>
+                                  ))}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div style={{marginTop:24,fontSize:10,color:DIM,lineHeight:1.8}}>
+                    <span style={{color:ACCENT}}>Seed region</span> (highlighted in sequence) = last 8 nt before PAM — most critical for specificity. &nbsp;
+                    Optimal GC: 35–65%. &nbsp; Run-length penalty for homopolymers &gt;4 identical bases.
+                  </div>
+                </>
+              )}
+            </main>
+          </div>
+
+          <style>{`
+            @keyframes loading {
+              0%{width:0%;margin-left:0}
+              50%{width:60%;margin-left:20%}
+              100%{width:0%;margin-left:100%}
+            }
+          `}</style>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>

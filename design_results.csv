@@ -1,0 +1,4 @@
+id,seq,pam,locus,strand,gc,score
+guide_rl_9cf66d1c_000,CGATCGATCGATCGATCGAT,CGG,pos:107,+,0.5,0.1858
+guide_rl_9cf66d1c_001,CGATCGATCGATCGATCGAT,CGG,pos:173,+,0.5,0.1355
+guide_rl_9cf66d1c_002,CGATCGATCGATCGATCGAT,CGG,pos:305,+,0.5,0.0349

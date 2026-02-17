@@ -1,0 +1,35 @@
+[
+  {
+    "id": "guide_rl_9cf66d1c_000",
+    "seq": "CGATCGATCGATCGATCGAT",
+    "pam": "CGG",
+    "locus": "pos:107",
+    "strand": "+",
+    "gc": 0.5,
+    "score": 0.1858,
+    "risk_flags": [],
+    "explanations": {}
+  },
+  {
+    "id": "guide_rl_9cf66d1c_001",
+    "seq": "CGATCGATCGATCGATCGAT",
+    "pam": "CGG",
+    "locus": "pos:173",
+    "strand": "+",
+    "gc": 0.5,
+    "score": 0.1355,
+    "risk_flags": [],
+    "explanations": {}
+  },
+  {
+    "id": "guide_rl_9cf66d1c_002",
+    "seq": "CGATCGATCGATCGATCGAT",
+    "pam": "CGG",
+    "locus": "pos:305",
+    "strand": "+",
+    "gc": 0.5,
+    "score": 0.0349,
+    "risk_flags": [],
+    "explanations": {}
+  }
+]

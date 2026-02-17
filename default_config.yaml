@@ -1,0 +1,33 @@
+profiles:
+  knockout:
+    w_specificity: 0.5
+    w_efficiency: 0.3
+    w_coverage: 0.2
+  knockdown:
+    w_specificity: 0.3
+    w_efficiency: 0.5
+    w_coverage: 0.2
+  screening:
+    w_specificity: 0.2
+    w_efficiency: 0.3
+    w_coverage: 0.5
+
+pam_patterns:
+  SpCas9: "NGG"
+  Cas12a: "TTTN"
+  SaCas9: "NNGRRT"
+
+constraints:
+  max_homopolymer_run: 5
+  gc_min: 0.35
+  gc_max: 0.65
+  max_candidates: 20
+  seed_region_length: 12
+
+rl:
+  epsilon_start: 0.3
+  epsilon_end: 0.05
+  epsilon_decay: 0.995
+  ucb_c: 1.414
+  n_training_steps: 500
+  seed: 42
